@@ -1,0 +1,3 @@
+numpy>=2.2.0.dev0
+pyserial>=3.5
+pygame>=2.6.0
