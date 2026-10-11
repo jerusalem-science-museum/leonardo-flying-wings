@@ -1,267 +1,390 @@
 #!/usr/bin/python3
-
+import glob
+import math
+import os
+import platform
+import sys
 import time
-import serial
-import pygame
+import traceback
+from collections import deque
+
+# Mute Linux ALSA audio driver warnings (must be set before pygame is used)
+os.environ['SDL_AUDIODRIVER'] = 'dummy'
+
 import numpy as np
+import pygame
+import serial
 
 import constants
 
-import platform
+# -----------------------------------------------------------------------------
+# Tuning
+# -----------------------------------------------------------------------------
+NUM_OF_PLOT_POINTS = 100
+FPS = 30
 
-time_per_sample = 0.0 # to be calculate acording to time take to read data
-time_per_draw = 0.0 # to be calculate acording to time take to update draw
-time_per_plot_update = 0.0 # need to to be larger then time per draw * safe margine
+# Calibration
+CAL_SAMPLES = 30          # samples wanted for the baseline (tara)
+MIN_CAL_SAMPLES = 5       # fewer than this = calibration failed
+CAL_TIMEOUT_SEC = 8.0     # time allowed to collect samples (after Arduino boot)
 
-x = []
-y = []
-new_y = []
-tara = 0
-mean_y = 100.0
-number_of_points = constants.NUM_OF_PLOT_POINTS
+# Serial
+BOOT_DELAY_SEC = 2.0      # Arduino usually resets when the port opens
+RECONNECT_SEC = 2.0       # retry interval when the sensor is unplugged
+NO_DATA_SEC = 2.0         # port is open but silent for this long = "No data"
 
-images = []
-#frames =[]
-#current_frame = 0
-current_image = 0
+# Signal processing
+FILTER_ALPHA = 0.1                # smoothing, applied once per frame
+MIN_SCALE_SPAN = 20000.0
+DECAY_RATE = 0.990
+DEAD_ZONE_FRAC = 0.02             # ignore effort below 2% of MIN_SCALE_SPAN
+DEAD_ZONE = DEAD_ZONE_FRAC * MIN_SCALE_SPAN
 
-def fill_images():
-    global images
-    del images[:]
-    for j in range(constants.NUMBER_OF_IMAGES):
-        images.append(pygame.image.load(constants.RES_PATH + '/image_' + str(j) + '.png'))
-    print (images)
-
-
-def clear_screen(color):
-    screen_surface.fill(color)
-    text_rect = label.get_rect(center=(main_screen.get_width() // 2, main_screen.get_height() // 2))
-    main_screen.blit(screen_surface, (0,0))
-    pygame.display.flip()
+LABEL_MAX_WIDTH_FRAC = 0.9        # calibration label may use 90% of screen width
 
 
-def update_plot_area():
-    x1 = constants.P_A_X
-    y1 = constants.P_A_Y
-    x2 = x1 + constants.P_A_W
-    y2 = y1 + constants.P_A_H
-    
-    color = constants.P_A_C
-    plot_surface.fill(color)
-    main_screen.blit(plot_surface, (x1,y1))
-    color = constants.P_A_F_C
-    thick = constants.P_A_F_T
-    pygame.draw.lines(main_screen,color, True,( (x1, y1), (x2,y1), (x2,y2),(x1,y2)), thick)
-    
-           
-    pygame.display.flip()
+class QuitRequested(Exception):
+    """Raised from anywhere to leave the program cleanly."""
 
-def update_image(image_number, x, y):
-    image_surface.fill(constants.IMAGE_BK_COLOR)
-    main_screen.blit(image_surface, constants.IMAGE_X_Y)
-    main_screen.blit(images[image_number], (x,y))
-    #pygame.display.flip()
 
-# fill initial value and meausre read time 
-def fill_data():
-    global current_image
-    global time_per_sample
-    global time_per_plot_update
-    global x
-    global y
-    global tara
-    global number_of_points
-    global mean_y
-    del x[:]
-    del y[:]
-    t_start = time.time()
-    for i in range(number_of_points):
-        #print(i)
-        x.append(i)
-        while (arduinoData.inWaiting()==0): #Wait here until there is data
-            pass #do nothing
-        arduinoString = arduinoData.readline() #read the line of text from the serial port
+# -----------------------------------------------------------------------------
+# Serial sensor
+# -----------------------------------------------------------------------------
+class Sensor:
+    """Reads numeric lines from the Arduino, survives unplug/replug."""
+
+    def __init__(self):
+        self.ser = None
+        self.opened_at = 0.0
+        self.last_attempt = -1e9
+        self.flushed = False
+        self.skip = 0
+        self.last_data = 0.0
+
+    @staticmethod
+    def candidate_ports():
+        if platform.system() == "Windows":
+            return ['COM3']
+        ports = sorted(glob.glob('/dev/ttyUSB*')) + sorted(glob.glob('/dev/ttyACM*'))
+        return ports or ['/dev/ttyUSB0']
+
+    def connected(self):
+        return self.ser is not None and self.ser.is_open
+
+    def no_data(self):
+        """True if the port is open but nothing has arrived for NO_DATA_SEC."""
+        if not self.connected():
+            return False
+        since = max(self.last_data, self.opened_at + BOOT_DELAY_SEC)
+        return time.time() - since > NO_DATA_SEC
+
+    def _try_open(self):
+        for port in self.candidate_ports():
+            try:
+                self.ser = serial.Serial(port, constants.BAUDRATE, timeout=0.01)
+                self.opened_at = time.time()
+                self.flushed = False
+                self.last_data = 0.0
+                print(f"Port {port} opened at {constants.BAUDRATE} baud.")
+                return True
+            except (serial.SerialException, OSError) as e:
+                print(f"Could not open {port}: {e}")
+        return False
+
+    def close(self):
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.ser = None
+
+    def read_values(self):
+        """Return a list of new float readings (possibly empty). Never blocks long."""
+        now = time.time()
+
+        if not self.connected():
+            if now - self.last_attempt >= RECONNECT_SEC:
+                self.last_attempt = now
+                self._try_open()
+            return []
+
+        # Give the Arduino time to boot after the port opened
+        if now - self.opened_at < BOOT_DELAY_SEC:
+            return []
+
+        values = []
         try:
-            y.append(float(arduinoString))
-        except:
-            y.append(0)
-        #current_image = (current_image+1) % constants.NUMBER_OF_IMAGES
-        #update_image(current_image, constants.IMAGE_X, constants.IMAGE_Y - current_image*constants.DH)
-    time_per_sample = ((time.time()-t_start)/number_of_points)
-    print( 'time per sample = ' , time_per_sample)
-    tara = np.mean(y)
-    print ('tara = ', tara)
-    mean_y = np.mean(y)
+            if not self.flushed:
+                self.ser.reset_input_buffer()
+                self.flushed = True
+                self.skip = 2  # first line(s) after a flush may be partial
+                return []
+
+            while self.ser.in_waiting > 0:
+                raw = self.ser.readline()
+                if self.skip > 0:
+                    self.skip -= 1
+                    continue
+                try:
+                    val = float(raw.decode('utf-8', errors='ignore').strip())
+                except ValueError:
+                    continue  # bad line: skip only this one
+                if not math.isfinite(val):
+                    continue
+                if val >= 2 ** 31:
+                    val -= 2 ** 32  # undo uint32 wrap-around from the Arduino's offset
+                values.append(val)
+        except (serial.SerialException, OSError) as e:
+            print(f"Sensor disconnected: {e}")
+            self.close()
+        if values:
+            self.last_data = time.time()
+        return values
 
 
-def update_plot_data(new_data):
-    global y
-    global new_y
-    global mean_y
-    global tara
-    y.append(new_data)
-    y.pop(0)
-    new_y = [(x / mean_y) for x in y]
-    #mean_y = np.mean(y)
+# -----------------------------------------------------------------------------
+# Application
+# -----------------------------------------------------------------------------
+class App:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption('In case of problem call amir')
 
+        info = pygame.display.Info()
+        self.desktop_size = (info.current_w, info.current_h)
+        self.fullscreen = constants.FULL_SCREEN
+        self.clock = pygame.time.Clock()
 
-def update_plot():
-    global x
-    global y
-    global new_y
-    global mean_y
-    global number_of_points
-    global time_per_draw
-    thick = constants.LINE_WIDTH
-    color = constants.LINE_COLOR
-    mean_y= np.mean(y)
-    #print (mean_y)
-    #print (np.mean(y))
-    #print (np.max(y))
-    #print (np.min(y))
-    
-    x_l = constants.P_A_X # x left
-    dx = constants.P_A_W/(number_of_points-1)
-   
-    y_up = constants.P_A_Y
-    y_dn = y_up+constants.P_A_H
-    #y_range = mean_y*2*constants.SCALE_FACTOR
-    y_range = mean_y*(constants.SCALE_FACTOR_UP+constants.SCALE_FACTOR_DN)
-    if y_range == 0:
-        y_range = 100 # make sure not divide with zero 
-    ymin = mean_y*(1 - constants.SCALE_FACTOR_UP)
-    #ymax = mean_y*(1 + constants.SCALE_FACTOR)
-    scale = constants.P_A_H/y_range
-    #y0 = y0+(y[0]-y_min)*scale
-    x1 = x_l
-    y1 = y_up+(y[0]-ymin)*scale
-    if y1 < y_up:
-        y1 = y_up 
-    if y1 > y_dn:
-        y1 = y_dn
-    
-    update_plot_area() #clean area
-    for i in range(1, number_of_points):
-        x2 = x_l+i*dx
-        y2 = y_up+(y[i]-ymin)*scale
-        if y2 < y_up:
-            y2 = y_up 
-        if y2 > y_dn:
-            y2 = y_dn
-        pygame.draw.line(main_screen,color, (x1, y1), (x2,y2), thick)
-        x1 = x2
-        y1 = y2
-    current_image = int(constants.NUMBER_OF_IMAGES*((y[number_of_points-1]-ymin))/y_range)
-    if current_image <=0 :
-        current_image = 0
-    if current_image >= (constants.NUMBER_OF_IMAGES-1):
-        current_image = (constants.NUMBER_OF_IMAGES-1)
-    #print ('current image is ' , current_image)
-    #current_image = (current_image+1) % constants.NUMBER_OF_IMAGES
-    update_image(current_image, constants.PICTURE_X, constants.PICTURE_Y - current_image*constants.DH)
-    pygame.display.flip()
- 
-#---------------------------------
-#---------------------------
-# progran start here
+        self.screen = self.open_display()
+        self.raw_images = self.load_images()
+        self.build_layout()
 
-#fill initial images for animations
-fill_images()
+        self.sensor = Sensor()
+        self.y_data = deque(maxlen=NUM_OF_PLOT_POINTS)
+        self.tara = 0.0
+        self.filtered = 0.0
+        self.max_delta = MIN_SCALE_SPAN
+        self.calibrated = False
+        self.recalibrate = False
 
-# initialize the pygame module
-pygame.init()
-clock = pygame.time.Clock()
-infoObject = pygame.display.Info()
-# load and set the logo
-# logo = pygame.image.load('icon.png')
-# pygame.display.set_icon(logo)
-pygame.display.set_caption('in case of problem call amir 972-542406559') 
-# define image and plot area surfaces on screen
-main_screen = pygame.display.set_mode((infoObject.current_w, infoObject.current_h))
-screen_surface = pygame.Surface((constants.SCREEN_W,constants.SCREEN_H))
-image_surface = pygame.Surface((constants.IMAGE_W,constants.IMAGE_H))
-plot_surface = pygame.Surface((constants.P_A_W,constants.P_A_H))
+    # ---- display / layout --------------------------------------------------
+    def open_display(self):
+        if self.fullscreen:
+            screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            w, h = self.desktop_size
+            screen = pygame.display.set_mode((w * 4 // 5, h * 4 // 5))
+        pygame.mouse.set_visible(constants.MOUSE_VISIBLE)
+        return screen
 
-myfont = pygame.font.SysFont(constants.FONT_TYPE, constants.FONT_SIZE)
-label = myfont.render(constants.LABEL, 1, constants.FONT_COLOR)
+    def load_images(self):
+        images = []
+        for j in range(constants.NUMBER_OF_IMAGES):
+            path = f"{constants.RES_PATH}/image_{j}.png"
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Missing animation frame: {path}")
+            images.append(pygame.image.load(path).convert_alpha())
+        return images
 
-if (constants.FULL_SCREEN == True):
-    pygame.display.toggle_fullscreen() 
+    def build_layout(self):
+        """Compute all positions from the real screen size."""
+        w, h = self.screen.get_size()
+        s = min(w / constants.SCREEN_W, h / constants.SCREEN_H)
+        ox = (w - constants.SCREEN_W * s) / 2
+        oy = (h - constants.SCREEN_H * s) / 2
 
+        self.plot_rect = pygame.Rect(
+            round(ox + constants.P_A_X * s), round(oy + constants.P_A_Y * s),
+            round(constants.P_A_W * s), round(constants.P_A_H * s))
+        self.frame_w = max(1, round(constants.P_A_F_T * s))
+        self.line_w = max(1, round(constants.LINE_WIDTH * s))
+        self.pic_x = ox + constants.PICTURE_X * s
+        self.pic_y = oy + constants.PICTURE_Y * s
+        self.dh = constants.DH * s
 
-# open UART
-is_UART_connect = False # define flag about UART state
+        if abs(s - 1.0) > 0.01:
+            self.images = [
+                pygame.transform.smoothscale(
+                    img, (max(1, round(img.get_width() * s)), max(1, round(img.get_height() * s))))
+                for img in self.raw_images]
+        else:
+            self.images = list(self.raw_images)
 
-try:
-    if platform.system() == "Windows":
-        port_name = 'COM14'  # <<< COM # 
-    else:
-        port_name = '/dev/ttyUSB0'
-        
-    arduinoData = serial.Serial(port_name, constants.BOUDRATE, timeout=1)
-    print (f'Port {port_name} opened successfully!')
-    print("Baud rate configured to:", constants.BOUDRATE)
-    is_UART_connect = True
-except Exception as e:
-    is_UART_connect = False
-    print ("Serial connection failed:")
-    print (e)
-    raise SystemExit() # end program
+        self.label = self.fit_label(int(w * LABEL_MAX_WIDTH_FRAC))
+        self.status_font = pygame.font.SysFont(constants.FONT_TYPE, max(12, round(40 * s)))
 
-clear_screen(constants.SCREEN_COLOR) 
-main_screen.blit(label, constants.LABEL_X_Y )
-pygame.display.flip()
-# fill initial data vector, also use to calibrate min  Yaxis
-fill_data()# constants.NUM_OF_PLOT_POINTS - 1) #fill initial data and calculae reading rate
-a_time = time.time()
-update_plot()
-b_time =time.time()
-time_per_draw = b_time - a_time # calculate time per update screen with new fig
-print ('draw time =', time_per_draw)
-time_per_plot_update = constants.TIME_SAFE_MARGINE*max(time_per_sample*constants.NUM_OF_UPDATE_POINT, time_per_draw)
-print ('time_per_sample*constants.NUM_OF_UPDATE_POINT  = ', time_per_sample*constants.NUM_OF_UPDATE_POINT)
-print ('time_per_draw  = ', time_per_draw)
-print ('time per plot update  = ', time_per_plot_update)
+    def fit_label(self, max_width):
+        """Render the calibration label, shrinking the font so it fits the screen."""
+        size = constants.FONT_SIZE
+        font = pygame.font.SysFont(constants.FONT_TYPE, size)
+        surf = font.render(constants.LABEL, True, constants.FONT_COLOR)
+        if surf.get_width() > max_width:
+            size = max(12, int(size * max_width / surf.get_width()))
+            font = pygame.font.SysFont(constants.FONT_TYPE, size)
+            surf = font.render(constants.LABEL, True, constants.FONT_COLOR)
+        return surf
 
-clear_screen(constants.SCREEN_COLOR) 
-pygame.display.flip()
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self.screen = self.open_display()
+        self.build_layout()
 
+    # ---- events ------------------------------------------------------------
+    def handle_events(self, calibrating=False):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                raise QuitRequested
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                    raise QuitRequested
+                if calibrating:
+                    continue
+                if event.key == pygame.K_t:
+                    self.toggle_fullscreen()
+                elif event.key == pygame.K_r:
+                    self.recalibrate = True
 
-running = True
+    # ---- calibration -------------------------------------------------------
+    def draw_calibration(self):
+        self.screen.fill(constants.SCREEN_COLOR)
+        rect = self.label.get_rect(center=self.screen.get_rect().center)
+        self.screen.blit(self.label, rect)
+        pygame.display.flip()
 
-pygame.mouse.set_cursor((8,8),(0,0),(0,0,0,0,0,0,0,0),(0,0,0,0,0,0,0,0))
+    def calibrate(self):
+        """Measure the resting baseline (tara). Keeps the window responsive."""
+        print("Calibrating Tara - please wait...")
+        self.y_data.clear()
+        self.max_delta = MIN_SCALE_SPAN
 
-# main loop
-while running:
-    t_plot_update = time.time()
-    while time.time() - t_plot_update < time_per_plot_update: # interal read sensor loop
-        while (arduinoData.inWaiting()==0): #Wait here until there is data
-            pass #do nothing
-        arduinoString = arduinoData.readline() #read the line of text from the serial port
-        #print('{:,}'.format(float(arduinoString)))
-        update_plot_data(float(arduinoString))
-    #clock.tick(20)
-    update_plot()
-    #clock.tick(20)
-    # event handling, gets all event from the event queue
-    for event in pygame.event.get():
-        
-       
-        # only do something if the event is of type QUIT
-        #if event.type == pygame.QUIT:
-            # change the value to False, to exit the main loop
-       #     print('done')
-       #     running = False
-       #     pygame.quit()
-        pressed = pygame.key.get_pressed()
-    if pressed[pygame.K_q] or pressed[pygame.K_ESCAPE]:
-        print('quit')
-        running = False
+        samples = []
+        deadline = time.time() + BOOT_DELAY_SEC + CAL_TIMEOUT_SEC
+        while len(samples) < CAL_SAMPLES and time.time() < deadline:
+            self.handle_events(calibrating=True)
+            samples.extend(self.sensor.read_values())
+            self.draw_calibration()
+            self.clock.tick(60)  # also stops the loop from spinning at 100% CPU
+
+        if len(samples) >= MIN_CAL_SAMPLES:
+            self.tara = float(np.median(samples))  # median ignores outliers
+            self.calibrated = True
+            print(f"Baseline (Tara) calibrated to {self.tara} from {len(samples)} samples.")
+        else:
+            self.tara = 0.0
+            self.calibrated = False
+            print(f"Calibration failed ({len(samples)} samples). Will retry when the sensor is connected.")
+
+        self.filtered = self.tara
+        for _ in range(NUM_OF_PLOT_POINTS):
+            self.y_data.append(self.tara)
+
+    # ---- signal ------------------------------------------------------------
+    def effort(self, value):
+        e = abs(value - self.tara)
+        return 0.0 if e < DEAD_ZONE else e
+
+    def update_scale(self, current_effort):
+        if current_effort > self.max_delta:
+            self.max_delta = current_effort
+        else:
+            self.max_delta = max(MIN_SCALE_SPAN, self.max_delta * DECAY_RATE)
+
+    # ---- drawing -----------------------------------------------------------
+    def draw_frame(self):
+        screen = self.screen
+        rect = self.plot_rect
+        screen.fill(constants.SCREEN_COLOR)
+
+        y_list = list(self.y_data)
+        current_effort = self.effort(y_list[-1])
+        span = max(MIN_SCALE_SPAN, self.max_delta)
+
+        # Plot area background + frame
+        screen.fill(constants.P_A_C, rect)
+
+        baseline_y = rect.y + rect.height * 0.70
+        pixels_per_unit = (baseline_y - rect.y) / span
+        dx = rect.width / (NUM_OF_PLOT_POINTS - 1)
+
+        points = []
+        for i, val in enumerate(y_list):
+            py = baseline_y - self.effort(val) * pixels_per_unit
+            py = max(rect.top, min(py, rect.bottom))
+            points.append((rect.x + i * dx, py))
+        if len(points) > 1:
+            pygame.draw.lines(screen, constants.LINE_COLOR, False, points, self.line_w)
+
+        pygame.draw.rect(screen, constants.P_A_F_C, rect, self.frame_w)
+
+        # Dragon: frame and height follow the effort
+        normalized = max(0.0, min(current_effort / span, 1.0))
+        last = constants.NUMBER_OF_IMAGES - 1
+        idx = max(0, min(int(normalized * last), last))
+        offset = int(normalized * last * self.dh)
+        screen.blit(self.images[idx], (self.pic_x, self.pic_y - offset))
+
+        # Status message if the sensor is not there
+        status = None
+        if not self.sensor.connected():
+            status = "Sensor not connected - retrying..."
+        elif self.sensor.no_data():
+            status = "No data from sensor - check HX711 wiring"
+        if status:
+            msg = self.status_font.render(status, True, constants.RED)
+            screen.blit(msg, (10, screen.get_height() - msg.get_height() - 10))
+
+        pygame.display.flip()
+
+    # ---- main loop ---------------------------------------------------------
+    def run(self):
+        self.calibrate()
+
+        while True:
+            self.handle_events()
+
+            if self.recalibrate or (
+                    not self.calibrated and self.sensor.connected() and not self.sensor.no_data()):
+                self.recalibrate = False
+                self.calibrate()
+
+            values = self.sensor.read_values()
+            if values and self.calibrated:
+                latest = values[-1]  # one filter step per frame
+                self.filtered = FILTER_ALPHA * latest + (1.0 - FILTER_ALPHA) * self.filtered
+                self.y_data.append(self.filtered)
+
+            self.update_scale(self.effort(self.y_data[-1]))
+            self.draw_frame()
+            self.clock.tick(FPS)
+
+    def close(self):
+        self.sensor.close()
         pygame.quit()
-    if pressed[pygame.K_t]:pygame.display.toggle_fullscreen()
-    if pressed[pygame.K_f]: update_plot_area()
-    if pressed[pygame.K_d]: update_plot_area()
-    if pressed[pygame.K_r]: fill_data()     
-    if pressed[pygame.K_c]: clear_screen(constants.SCREEN_COLOR)
-    if pressed[pygame.K_p]: update_plot()
-    
+
+
+def main():
+    app = None
+    try:
+        app = App()
+        app.run()
+    except QuitRequested:
+        pass
+    finally:
+        if app is not None:
+            app.close()
+        else:
+            pygame.quit()
+    print("Program exited cleanly.")
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        print("\n" + "=" * 50)
+        print("CRASH DETECTED! ERROR DETAILS:")
+        print("=" * 50)
+        traceback.print_exc()
+        print("=" * 50)
+        sys.exit(1)
