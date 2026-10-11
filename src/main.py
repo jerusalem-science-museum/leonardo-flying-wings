@@ -34,9 +34,10 @@ RECONNECT_SEC = 2.0       # retry interval when the sensor is unplugged
 NO_DATA_SEC = 2.0         # port is open but silent for this long = "No data"
 
 # Signal processing
-FILTER_ALPHA = 0.1                # smoothing, applied once per frame
+FILTER_ALPHA = 0.4                # smoothing per new sample (higher = faster response)
+BASELINE_TAU_SEC = 0.7            # standing still fades out over a few seconds; flapping keeps it up
 MIN_SCALE_SPAN = 20000.0
-DECAY_RATE = 0.990
+DECAY_RATE = 0.98                 # how fast the scale relaxes after a big push
 DEAD_ZONE_FRAC = 0.02             # ignore effort below 2% of MIN_SCALE_SPAN
 DEAD_ZONE = DEAD_ZONE_FRAC * MIN_SCALE_SPAN
 
@@ -163,6 +164,7 @@ class App:
         self.sensor = Sensor()
         self.y_data = deque(maxlen=NUM_OF_PLOT_POINTS)
         self.tara = 0.0
+        self.baseline = 0.0   # slowly follows the signal, so standing still fades out
         self.filtered = 0.0
         self.max_delta = MIN_SCALE_SPAN
         self.calibrated = False
@@ -276,12 +278,14 @@ class App:
             print(f"Calibration failed ({len(samples)} samples). Will retry when the sensor is connected.")
 
         self.filtered = self.tara
+        self.baseline = self.tara
         for _ in range(NUM_OF_PLOT_POINTS):
-            self.y_data.append(self.tara)
+            self.y_data.append(0.0)  # history holds effort (movement), not raw values
 
     # ---- signal ------------------------------------------------------------
     def effort(self, value):
-        e = abs(value - self.tara)
+        """Movement = distance from the slowly adapting baseline, with a small dead zone."""
+        e = abs(value - self.baseline)
         return 0.0 if e < DEAD_ZONE else e
 
     def update_scale(self, current_effort):
@@ -297,7 +301,7 @@ class App:
         screen.fill(constants.SCREEN_COLOR)
 
         y_list = list(self.y_data)
-        current_effort = self.effort(y_list[-1])
+        current_effort = y_list[-1]
         span = max(MIN_SCALE_SPAN, self.max_delta)
 
         # Plot area background + frame
@@ -309,7 +313,7 @@ class App:
 
         points = []
         for i, val in enumerate(y_list):
-            py = baseline_y - self.effort(val) * pixels_per_unit
+            py = baseline_y - val * pixels_per_unit
             py = max(rect.top, min(py, rect.bottom))
             points.append((rect.x + i * dx, py))
         if len(points) > 1:
@@ -339,6 +343,7 @@ class App:
     # ---- main loop ---------------------------------------------------------
     def run(self):
         self.calibrate()
+        dt = 1.0 / FPS
 
         while True:
             self.handle_events()
@@ -347,16 +352,25 @@ class App:
                     not self.calibrated and self.sensor.connected() and not self.sensor.no_data()):
                 self.recalibrate = False
                 self.calibrate()
+                dt = 1.0 / FPS
 
             values = self.sensor.read_values()
-            if values and self.calibrated:
-                latest = values[-1]  # one filter step per frame
+            new_sample = bool(values) and self.calibrated
+            if new_sample:
+                latest = values[-1]  # one filter step per new reading
                 self.filtered = FILTER_ALPHA * latest + (1.0 - FILTER_ALPHA) * self.filtered
-                self.y_data.append(self.filtered)
 
-            self.update_scale(self.effort(self.y_data[-1]))
+            if self.calibrated:
+                # The baseline slowly follows the signal: standing still fades to zero,
+                # while fast movement (flapping) stays far from the baseline.
+                self.baseline += (self.filtered - self.baseline) * (1.0 - math.exp(-dt / BASELINE_TAU_SEC))
+
+            if new_sample:
+                self.y_data.append(self.effort(self.filtered))
+
+            self.update_scale(self.y_data[-1])
             self.draw_frame()
-            self.clock.tick(FPS)
+            dt = min(self.clock.tick(FPS) / 1000.0, 0.2)
 
     def close(self):
         self.sensor.close()
